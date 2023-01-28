@@ -13,36 +13,40 @@ from time import time, sleep, monotonic
 
 
 class Sensors:
-    def __init__(self):
-        self._listdir_count = 0
-        self._listdir_cache = {}
+    MAX_ULL = 2 ** 64
 
-    def _listdir(self, *paths):
-        cache = self._listdir_cache
+    def __init__(self):
+        self._io_count = 0
+        self._io_cache = {}
+
+    def _cached_io(self, io, *paths):
+        cache = self._io_cache
         now = monotonic()
         value = None
         error = None
         v = cache.get(paths)
         if v is None or (now - v[0]) > 60:
             try:
-                value = tuple(sorted(os.listdir(os.path.join(*paths))))
+                value = io(os.path.join(*paths))
             except BaseException as e:
                 error = e
             cache[paths] = now, value, error
         else:
-            value = v[1]
-            error = v[2]
+            _, value, error = v
 
-        self._listdir_count += 1
-        if self._listdir_count >= 100:
+        self._io_count += 1
+        if self._io_count >= 300:
             for k, (t, v, e) in tuple(cache.items()):
                 if now - t > 3600:
                     cache.pop(k)
-            self._listdir_count = 0
+            self._io_count = 0
 
         if error is None:
             return value
         raise error
+
+    def _list_dir(self, *paths):
+        return tuple(sorted(os.listdir(os.path.join(*paths))))
 
     #
     # The idiom:
@@ -122,7 +126,7 @@ class Sensors:
 
     def read_cpu_freqs(self, root='/sys/devices/system/cpu'):
         try:
-            for cpu_name in self._listdir(root):
+            for cpu_name in self._cached_io(self._list_dir, root):
                 if not cpu_name.startswith('cpu'):
                     continue
 
@@ -136,19 +140,20 @@ class Sensors:
 
     def read_power_caps(self, root='/sys/class/powercap'):
         try:
-            for powercap_name in self._listdir(root):
-                powercap_description = self._read_string(root, powercap_name, 'name')
+            for powercap_name in self._cached_io(self._list_dir, root):
+                powercap_description = self._cached_io(self._read_string, root, powercap_name, 'name')
                 if not powercap_description:
                     continue
                 powercap_value = self._read_integer(root, powercap_name, 'energy_uj')
                 if powercap_value is not None:
-                    yield powercap_name, powercap_description, powercap_value / 1000000
+                    powercap_max = self._cached_io(self._read_integer, root, powercap_name, 'max_energy_range_uj')
+                    yield powercap_name, powercap_description, powercap_value, powercap_max
         except OSError:
             pass
 
     def read_hardware_sensors(self, root='/sys/class/hwmon', sensors_re=re.compile(r'^((temp|fan)(\d+))_input$')):
         try:
-            for i in self._listdir(root):
+            for i in self._cached_io(self._list_dir, root):
                 if not i.startswith('hwmon'):
                     continue
                 hwmon_number = i[5:]
@@ -158,13 +163,13 @@ class Sensors:
 
                 inputs = set()
 
-                files = set(self._listdir(root, i))
+                files = set(self._cached_io(self._list_dir, root, i))
                 for j in files:
                     match = sensors_re.match(j)
                     if match:
                         inputs.add(match.groups())
 
-                sensor_name = self._read_string(root, i, 'name')
+                sensor_name = self._cached_io(self._read_string, root, i, 'name')
                 if not sensor_name:
                     continue
 
@@ -183,7 +188,9 @@ class Sensors:
                     if input_value is None:
                         continue
                     description_file = input_name + '_label'
-                    input_description = self._read_string(root, i, description_file) if description_file in files else None
+                    input_description = None
+                    if description_file in files:
+                        input_description = self._cached_io(self._read_string, root, i, description_file)
                     offset_file = input_name + '_offset'
                     if offset_file in files:
                         offset_value = self._read_integer(root, i, offset_file)
@@ -215,7 +222,11 @@ class Sensors:
                             curr_total_ticks, curr_spare_ticks = curr_v
                             prev_total_ticks, prev_spare_ticks = prev_v
                             total_ticks = curr_total_ticks - prev_total_ticks
+                            while total_ticks < 0:
+                                total_ticks += self.MAX_ULL
                             spare_ticks = curr_spare_ticks - prev_spare_ticks
+                            while spare_ticks < 0:
+                                spare_ticks += self.MAX_ULL
                             curr_results.append({
                                 'resource': 'cpu',
                                 'instance': (instance,),
@@ -233,15 +244,17 @@ class Sensors:
                     for instance, curr_v in curr_power_caps.items():
                         prev_v = prev_power_caps.get(instance)
                         if prev_v is not None:
-                            curr_description, curr_energy = curr_v
-                            prev_description, prev_energy = prev_v
+                            curr_description, curr_energy, curr_max = curr_v
+                            prev_description, prev_energy, prev_max = prev_v
                             energy_used = curr_energy - prev_energy
+                            while energy_used < 0:
+                                energy_used += 1 + curr_max
                             curr_results.append({
                                 'resource': 'power',
                                 'instance': (instance,),
                                 'description': curr_description,
                                 'quantity': 'power',
-                                'value': energy_used / dt,
+                                'value': energy_used / dt / 1000000.0,
                                 'unit': 'W',
                             })
                 prev_power_caps = curr_power_caps
